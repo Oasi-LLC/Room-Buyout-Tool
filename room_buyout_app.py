@@ -9,10 +9,17 @@ import pandas as pd
 from datetime import datetime, date, timedelta
 from pathlib import Path
 import sys
+import os
+from dotenv import load_dotenv
 
 # Add current directory to path
 tool_dir = Path(__file__).parent
 sys.path.insert(0, str(tool_dir))
+
+# Load environment variables
+env_path = tool_dir / ".env"
+if env_path.exists():
+    load_dotenv(env_path)
 
 from room_buyout_calculator import RoomBuyoutCalculator
 from generate_pl_daily import generate_pl_daily_for_property, generate_pl_daily_for_property_batched, save_pl_daily_csv
@@ -52,12 +59,14 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-@st.cache_data
 def load_properties():
     """Load available properties from config"""
     try:
         calculator = RoomBuyoutCalculator()
-        return list(calculator.properties_config.keys())
+        properties = list(calculator.properties_config.keys())
+        # Filter to only show onera and wb1 (in case config has others)
+        allowed_properties = ['onera', 'wb1']
+        return [p for p in properties if p in allowed_properties]
     except Exception as e:
         st.error(f"Error loading properties: {e}")
         return []
@@ -66,7 +75,60 @@ def format_currency(amount):
     """Format amount as currency"""
     return f"${amount:,.2f}"
 
+def check_authentication():
+    """Check if user is authenticated with @stayoasi.com email and password"""
+    # Get password from environment variable (default to a secure password if not set)
+    required_password = os.getenv('APP_PASSWORD', 'stayoasi2024')
+    
+    # Initialize authentication state
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+    if 'user_email' not in st.session_state:
+        st.session_state.user_email = None
+    
+    # If already authenticated, return True
+    if st.session_state.authenticated:
+        return True
+    
+    # Show login form
+    st.markdown('<div class="main-header">🔐 Login Required</div>', unsafe_allow_html=True)
+    st.markdown("---")
+    st.info("Please sign in with your @stayoasi.com email address and password to access the Room Buyout Calculator.")
+    
+    with st.form("login_form"):
+        email = st.text_input("Email Address", placeholder="your.name@stayoasi.com", type="default")
+        password = st.text_input("Password", type="password", placeholder="Enter your password")
+        submit_button = st.form_submit_button("Sign In", type="primary")
+        
+        if submit_button:
+            email = email.strip().lower()
+            password_input = password.strip()
+            
+            # Validate email domain
+            if not email or not email.endswith("@stayoasi.com"):
+                st.error("❌ Access denied. Please use a @stayoasi.com email address.")
+            elif not password_input:
+                st.error("❌ Please enter your password.")
+            elif password_input != required_password:
+                st.error("❌ Invalid password. Please try again.")
+            else:
+                # Both email and password are correct
+                st.session_state.authenticated = True
+                st.session_state.user_email = email
+                st.success(f"✅ Welcome, {email}!")
+                st.rerun()
+    
+    st.markdown("---")
+    st.caption("This application is restricted to StayOasi team members only.")
+    st.stop()
+    
+    return False
+
 def main():
+    # Check authentication first
+    if not check_authentication():
+        return
+    
     # Initialize session state
     if 'manual_selection_active' not in st.session_state:
         st.session_state.manual_selection_active = False
@@ -79,6 +141,17 @@ def main():
     
     # Header
     st.markdown('<div class="main-header">🏨 Room Buyout Calculator</div>', unsafe_allow_html=True)
+    
+    # Show user info and logout button
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        st.caption(f"Signed in as: {st.session_state.user_email}")
+    with col2:
+        if st.button("🚪 Logout", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state.user_email = None
+            st.rerun()
+    
     st.markdown("---")
     
     # Sidebar for inputs
@@ -111,9 +184,9 @@ def main():
         # Date selection
         st.subheader("📅 Dates")
         
-        # Default dates: today and 30 days from today
+        # Default dates: today and 2 nights (check-in + 2 days)
         default_checkin = date.today()
-        default_checkout = default_checkin + timedelta(days=30)
+        default_checkout = default_checkin + timedelta(days=2)
         
         # Set max date to a reasonable future date (e.g., 10 years from now)
         max_date = date.today() + timedelta(days=3650)  # ~10 years
@@ -127,9 +200,9 @@ def main():
         )
         
         # Calculate default checkout based on checkin_date to ensure it's always valid
-        # Use checkin_date + 30 days, but ensure it's within bounds
+        # Use checkin_date + 2 days (2 nights), but ensure it's within bounds
         min_checkout = checkin_date + timedelta(days=1)
-        calculated_default_checkout = checkin_date + timedelta(days=30)
+        calculated_default_checkout = checkin_date + timedelta(days=2)
         
         # Use the calculated default if it's valid, otherwise use min_checkout
         if calculated_default_checkout <= max_date and calculated_default_checkout >= min_checkout:
@@ -194,6 +267,8 @@ def main():
         
         if pull_data_button:
             st.session_state['pull_data_property'] = property_name
+            st.session_state['pull_data_checkin'] = checkin_date
+            st.session_state['pull_data_checkout'] = checkout_date
             st.session_state['pull_data_clicked'] = True
             st.rerun()
         
@@ -233,6 +308,9 @@ def main():
     # Handle pull fresh data request (check this first, before other content)
     if st.session_state.get('pull_data_clicked', False):
         property_to_pull = st.session_state.get('pull_data_property', None)
+        checkin_to_pull = st.session_state.get('pull_data_checkin', None)
+        checkout_to_pull = st.session_state.get('pull_data_checkout', None)
+        
         if property_to_pull:
             # Get property display name
             try:
@@ -244,8 +322,13 @@ def main():
             
             st.session_state['pull_data_clicked'] = False  # Reset flag
             
-            # Get date range from date manager (already returns strings)
-            start_date, end_date = get_pl_daily_date_range()
+            # Use selected dates if available, otherwise fall back to default date range
+            if checkin_to_pull and checkout_to_pull:
+                start_date = checkin_to_pull.strftime('%Y-%m-%d')
+                end_date = checkout_to_pull.strftime('%Y-%m-%d')
+            else:
+                # Fallback to default date range if dates not available
+                start_date, end_date = get_pl_daily_date_range()
             
             st.subheader("🔄 Pulling Fresh Data")
             st.info(f"Pulling fresh data for **{property_display_name_pull}**...")
@@ -483,7 +566,7 @@ def main():
                 else:
                     st.write(f"Available: {max_units}")
             with col4:
-                st.caption(f"\${listing['cost_per_room']:,.0f}/room/night")
+                st.caption(f"${listing['cost_per_room']:,.0f}/room/night")
         
         # Show updated counter at bottom
         current_total = sum(
@@ -649,7 +732,7 @@ def main():
                                 st.write(f"Available: {max_units}")
                         with col4:
                             # Show rate per room per night
-                            st.caption(f"\${listing['cost_per_room']:,.0f}/room/night")
+                            st.caption(f"${listing['cost_per_room']:,.0f}/room/night")
                     
                     # Collect manual selections from session state
                     manual_selections = []
