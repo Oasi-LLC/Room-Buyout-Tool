@@ -6,7 +6,7 @@ Easy-to-use web interface for calculating room buyout costs.
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime, date, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 import sys
 import os
@@ -24,6 +24,7 @@ if env_path.exists():
 from room_buyout_calculator import RoomBuyoutCalculator
 from generate_pl_daily import generate_pl_daily_for_property, generate_pl_daily_for_property_batched, save_pl_daily_csv
 from utils.date_manager import get_pl_daily_date_range
+from utils.config import API_KEY
 
 # Page configuration
 st.set_page_config(
@@ -74,6 +75,53 @@ def load_properties():
 def format_currency(amount):
     """Format amount as currency"""
     return f"${amount:,.2f}"
+
+
+def load_live_stay_data(calculator, property_name, start_date, end_date):
+    """Fetch live prices and occupancy once per property/stay; reuse across reruns."""
+    cache = st.session_state.setdefault('live_stay_cache', {})
+    key = f"{property_name}|{start_date}|{end_date}"
+    if key in cache:
+        return cache[key]
+
+    status = st.empty()
+    progress = st.progress(0)
+
+    def on_progress(i, n, name):
+        n = max(n, 1)
+        status.text(f"Fetching live PriceLabs data ({i + 1}/{n}): {name}")
+        progress.progress(min(1.0, (i + 1) / n))
+
+    stay = calculator.fetch_live_stay_data(
+        property_name, start_date, end_date, progress_callback=on_progress
+    )
+    status.empty()
+    progress.empty()
+    cache[key] = stay
+    return stay
+
+
+def live_data_source_caption(rate_source, occupancy_source):
+    """Explain where quote prices vs occupancy came from."""
+    rate_label = {
+        'api': 'live PriceLabs listing overrides',
+        'csv': 'local nightly_pulled_overrides.csv',
+        'none': 'local pl_daily',
+    }.get(rate_source, 'local pl_daily')
+    occ_label = {
+        'api': 'live PriceLabs listing_prices / reservation_data',
+        'csv': 'local pl_daily',
+        'none': 'local pl_daily',
+    }.get(occupancy_source, 'local pl_daily')
+    st.caption(f"Prices from {rate_label}. Occupancy from {occ_label}.")
+
+
+def show_no_rate_data_error(property_display_name):
+    st.error(f"❌ No rate data found for {property_display_name}.")
+    if not API_KEY:
+        st.info("💡 Live PriceLabs did not run because `PRICELABS_API_KEY` is not set. Add it to `.env` and restart Streamlit.")
+    else:
+        st.info("💡 No live rates came back for these dates, and local pl_daily does not cover this stay.")
 
 def check_authentication():
     """Check if user is authenticated with @stayoasi.com email and password"""
@@ -178,6 +226,12 @@ def main():
             st.info(f"**Property:** {property_display_name}")
         except:
             property_display_name = property_name
+
+        if not API_KEY:
+            st.error(
+                "PriceLabs API key is missing. Add `PRICELABS_API_KEY` to a `.env` file "
+                "in this project folder and restart Streamlit."
+            )
         
         st.markdown("---")
         
@@ -260,8 +314,8 @@ def main():
         # Pull Fresh Data button
         st.subheader("🔄 Data Management")
         pull_data_button = st.button(
-            "📥 Pull Fresh Data",
-            help="Pull the latest rates and occupancy data from PriceLabs API for this property",
+            "📥 Save Occupancy Fallback",
+            help="Optional: write occupancy to local pl_daily in case live PriceLabs is unavailable. Calculate already fetches occupancy live.",
             use_container_width=True
         )
         
@@ -360,11 +414,11 @@ def main():
                     status_text.empty()
                     progress_bar.empty()
                     
-                    st.success(f"✅ Successfully pulled fresh data for **{property_display_name_pull}**!")
+                    st.success(f"✅ Saved occupancy fallback for **{property_display_name_pull}**!")
                     st.info(f"📁 Data saved to: `{filepath}`")
-                    st.info("💡 You can now calculate buyout costs with the latest data.")
+                    st.info("💡 Calculate still fetches live occupancy and rates from PriceLabs.")
                     
-                    # Clear any cached results to force refresh
+                    st.session_state.pop('live_stay_cache', None)
                     if 'buyout_data' in st.session_state:
                         del st.session_state['buyout_data']
                     if 'show_buyout_results' in st.session_state:
@@ -500,17 +554,20 @@ def main():
         end_date = checkout_date.strftime('%Y-%m-%d')
         dates = calculator.generate_date_range(start_date, end_date)
         
-        # Get room rates
+        stay = load_live_stay_data(calculator, property_name, start_date, end_date)
+        live_data_source_caption(stay['rate_source'], stay['occupancy_source'])
         room_rates = calculator.get_room_rates(
             property_name, 
             start_date, 
             end_date, 
-            use_live_rates=False
+            use_live_rates=True,
+            live_rates=stay['live_rates'],
+            use_live_occupancy=True,
+            occupancy=stay['occupancy'],
         )
         
         if not room_rates:
-            st.error(f"❌ No rate data found for {property_display_name}. Please ensure pl_daily files are generated.")
-            st.info("💡 Run: `python generate_pl_daily.py {property_name}` to generate data")
+            show_no_rate_data_error(property_display_name)
             st.stop()
         
         # Get available listings for display
@@ -651,17 +708,20 @@ def main():
                 # Generate date range
                 dates = calculator.generate_date_range(start_date, end_date)
                 
-                # Get room rates
+                stay = load_live_stay_data(calculator, property_name, start_date, end_date)
+                live_data_source_caption(stay['rate_source'], stay['occupancy_source'])
                 room_rates = calculator.get_room_rates(
                     property_name, 
                     start_date, 
                     end_date, 
-                    use_live_rates=False  # Use pl_daily for occupancy data
+                    use_live_rates=True,
+                    live_rates=stay['live_rates'],
+                    use_live_occupancy=True,
+                    occupancy=stay['occupancy'],
                 )
                 
                 if not room_rates:
-                    st.error(f"❌ No rate data found for {property_display_name}. Please ensure pl_daily files are generated.")
-                    st.info("💡 Run: `python generate_pl_daily.py {property_name}` to generate data")
+                    show_no_rate_data_error(property_display_name)
                     st.stop()
                 
                 # Get available listings for display
@@ -905,7 +965,7 @@ def main():
         - ✅ Shows detailed breakdown by listing and by night
         - ✅ Displays individual room rates
         
-        **Note:** Make sure pl_daily files are generated for the property you want to use.
+        **Note:** Prices and occupancy are fetched live from PriceLabs when you calculate. Local pl_daily is only a fallback if the API is unavailable.
         """)
         
         # Show available properties

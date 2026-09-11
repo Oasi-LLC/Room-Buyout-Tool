@@ -18,9 +18,18 @@ else:
 API_KEY = os.getenv('PRICELABS_API_KEY')
 BASE_URL = os.getenv('API_BASE_URL', 'https://api.pricelabs.co/v1')
 
-# Validation
-if not API_KEY:
-    raise ValueError("PRICELABS_API_KEY environment variable is required. Create a .env file with your API key.")
+# Delay between sequential listing override GETs (seconds)
+OVERRIDE_REQUEST_DELAY = 1.35
+
+
+def require_api_key():
+    """Raise if the PriceLabs API key is missing. Call this before making API requests."""
+    if not API_KEY:
+        raise ValueError(
+            "PRICELABS_API_KEY environment variable is required. "
+            "Create a .env file with your API key."
+        )
+    return API_KEY
 
 # Price Adjustment Configuration
 ADJUSTMENT_PERCENTAGE = 5  # 5% adjustment

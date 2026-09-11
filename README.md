@@ -106,9 +106,9 @@ Check that `config/properties.yaml` exists and contains property definitions. Th
 - Rate group mappings
 - Adjustment rules
 
-### Step 6: Generate Data (First Time)
+### Step 6: (Optional) Generate Local Fallback Data
 
-Before using the calculator, you need to generate rate and occupancy data:
+Calculate already fetches live rates and occupancy from PriceLabs. Local `pl_daily` files are only a fallback if the API is unavailable.
 
 ```bash
 # Generate data for a single property
@@ -120,7 +120,6 @@ python generate_all_pl_daily.py
 
 This creates `pl_daily_{property}.csv` files in `data/{property}/` directories.
 
-**Note**: This step requires internet connection and API access. It may take several minutes depending on the number of listings.
 
 ### Step 7: Test the Installation
 
@@ -176,14 +175,19 @@ The results show:
 - **Breakdown by Night**: Cost for each individual night
 - **Breakdown by Listing**: Which listings were selected and their costs
 
-### Pulling Fresh Data
+### How quotes get data
 
-Click "📥 Pull Fresh Data" in the sidebar to:
-- Fetch latest rates from PriceLabs API
-- Update occupancy information
-- Regenerate `pl_daily` files
+When you click **Calculate Buyout**, the app fetches:
+- **Prices** from PriceLabs `GET /listings/{id}/overrides`
+- **Occupancy** from `POST /listing_prices` (1-unit listings) and `GET /reservation_data` (multi-unit booked counts)
 
-**Note**: This may take several minutes for properties with many listings.
+Local `pl_daily` files are used only if the API is unavailable.
+
+### Optional local fallback
+
+Click "📥 Save Occupancy Fallback" in the sidebar (or run `python generate_pl_daily.py {property}`) to write occupancy to `pl_daily` for offline use.
+
+**Note**: A live calculate may take a minute for properties with many listings.
 
 ## 💻 Using the Python API
 
@@ -212,7 +216,6 @@ room_rates = calculator.get_room_rates(
     property_name=property_name,
     start_date=start_date,
     end_date=end_date,
-    use_live_rates=False  # Use pl_daily data (has occupancy info)
 )
 
 # Select cheapest rooms
@@ -344,9 +347,9 @@ data/
 - Example: Sept 7-9 means nights of Sept 7 and 8 only
 
 ### 5. Rate Priority
-- **Primary**: Uses `pl_daily` data (has occupancy information)
-- **Fallback**: Can use live rates if `pl_daily` unavailable
-- **Override**: Live rates can override prices while keeping occupancy data
+- **Prices**: Live PriceLabs listing overrides; `pl_daily` / nightly CSV if the API is unavailable
+- **Occupancy**: Live `listing_prices` (1-unit) and `reservation_data` (multi-unit counts)
+- Fully booked when `No. Booked >= Units` (units from `config/properties.yaml`)
 
 ### 6. Error Handling
 - Validates CSV file structure before processing
@@ -457,8 +460,8 @@ This verifies:
 - **Solution**: Ensure the file exists and contains property definitions
 
 #### 2. "No rate data found"
-- **Cause**: `pl_daily` files not generated
-- **Solution**: Run `python generate_pl_daily.py {property_name}`
+- **Cause**: PriceLabs API key missing, or no live/local rates for the selected dates
+- **Solution**: Add `PRICELABS_API_KEY` to `.env` and restart Streamlit
 
 #### 3. "PRICELABS_API_KEY environment variable is required"
 - **Cause**: `.env` file missing or API key not set
@@ -480,7 +483,7 @@ This verifies:
 
 1. Check error messages - they usually indicate the problem
 2. Verify all prerequisites are met
-3. Ensure data files are generated
+3. Confirm `.env` has a valid PriceLabs API key
 4. Check API key is valid
 5. Review configuration files
 
@@ -529,7 +532,7 @@ To move this tool to a new location:
    ```
 4. Set up `.env` with API key
 5. Copy/configure `config/properties.yaml`
-6. Generate data files:
+6. (Optional) Generate local fallback files:
    ```bash
    python generate_all_pl_daily.py
    ```
@@ -538,15 +541,11 @@ That's it! No other dependencies needed.
 
 ## 🔄 Updating Data
 
-### When to Update
+Quotes fetch live PriceLabs rates and occupancy when you calculate, so you do not need to refresh `pl_daily` first.
 
-- **Daily**: For accurate availability (recommended)
-- **Before major bookings**: To ensure latest rates
-- **After rate changes**: To reflect new pricing
+### Optional local fallback
 
-### How to Update
-
-1. **Via Web Interface**: Click "📥 Pull Fresh Data" button
+1. **Via Web Interface**: Click "📥 Save Occupancy Fallback"
 2. **Via Command Line**: `python generate_pl_daily.py {property_name}`
 3. **All Properties**: `python generate_all_pl_daily.py`
 
@@ -556,7 +555,7 @@ That's it! No other dependencies needed.
 - **Availability is date-specific**: A room available on one date may not be available on another
 - **Rates can vary by date**: Weekend rates, seasonal pricing, etc.
 - **Multi-unit listings**: Tool handles partial unit selection correctly
-- **Data freshness**: Stale data may show incorrect availability
+- **Data freshness**: Calculate uses live PriceLabs data; local `pl_daily` is fallback only
 
 ## 🎯 Quick Reference
 
@@ -568,7 +567,7 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# Generate data
+# Optional local fallback data
 python generate_pl_daily.py onera
 python generate_all_pl_daily.py
 

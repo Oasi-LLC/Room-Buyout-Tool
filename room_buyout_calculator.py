@@ -7,9 +7,12 @@ Calculates individual room rates and total buyout costs for any property and dat
 import pandas as pd
 import yaml
 from pathlib import Path
-from datetime import datetime, date, timedelta
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Callable
 from dataclasses import dataclass
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -372,6 +375,24 @@ class RoomBuyoutCalculator:
                         vacant_units = max(0, vacant_units)  # Ensure non-negative
                     except (ValueError, TypeError):
                         vacant_units = 0
+
+                    # Fully booked nights: No. Booked >= Units (occupancy is not on the live-rates GET)
+                    booked = 0
+                    units_count = 0
+                    if 'No. Booked' in df.columns:
+                        try:
+                            booked_val = row.get('No. Booked', 0)
+                            booked = int(booked_val) if pd.notna(booked_val) else 0
+                        except (ValueError, TypeError):
+                            booked = 0
+                    if 'Units' in df.columns:
+                        try:
+                            units_val = row.get('Units', 0)
+                            units_count = int(units_val) if pd.notna(units_val) else 0
+                        except (ValueError, TypeError):
+                            units_count = 0
+                    if units_count > 0 and booked >= units_count:
+                        vacant_units = 0
                     
                     availability[key] = vacant_units > 0
                     vacant_units_dict[key] = vacant_units
@@ -389,12 +410,177 @@ class RoomBuyoutCalculator:
         
         return rates, availability, vacant_units_dict
     
+    def fetch_live_stay_data(
+        self,
+        property_name: str,
+        start_date: str,
+        end_date: str,
+        progress_callback: Optional[Callable] = None
+    ) -> Dict:
+        """
+        Live prices (GET overrides) and occupancy for a stay.
+
+        Occupancy:
+          - 1-unit: POST /listing_prices (`Booked` in booking_status, unbookable)
+          - multi-unit: GET /reservation_data for booked count; listing_prices for unbookable
+        Units come from properties.yaml. Falls back to local CSVs if the API is unavailable.
+        """
+        dates = self.generate_date_range(start_date, end_date)
+        pl_rates, pl_availability, pl_vacant = self._load_pl_daily_rates(property_name, dates)
+        csv_rates = self._load_live_rates(property_name, dates)
+        empty = {
+            'live_rates': {},
+            'occupancy': {'availability': {}, 'vacant_units': {}},
+            'rate_source': 'none',
+            'occupancy_source': 'none',
+        }
+        if not dates:
+            return empty
+
+        prop_config = self.properties_config.get(property_name, {})
+        pms = prop_config.get('pms', 'cloudbeds')
+        listings = prop_config.get('listings', [])
+
+        try:
+            from utils.api_client import (
+                PriceLabsAPI,
+                parse_listing_overrides,
+                count_reservations_by_date,
+                compute_nightly_occupancy,
+            )
+            api = PriceLabsAPI(enable_caching=False)
+        except Exception as e:
+            logger.warning(f"Live stay fetch unavailable: {e}")
+            result = dict(empty)
+            if csv_rates:
+                result['live_rates'] = csv_rates
+                result['rate_source'] = 'csv'
+            if pl_availability:
+                result['occupancy'] = {
+                    'availability': pl_availability,
+                    'vacant_units': pl_vacant,
+                }
+                result['occupancy_source'] = 'csv'
+            return result
+
+        has_multi = any(int(listing.get('units', 1) or 1) > 1 for listing in listings)
+        reservations = []
+        total_steps = len(listings) + (1 if has_multi else 0)
+        step = 0
+
+        if has_multi:
+            if progress_callback:
+                progress_callback(step, total_steps, "Reservations")
+            try:
+                reservations = api.fetch_all_reservations(pms, start_date, end_date)
+            except Exception as e:
+                logger.warning(f"reservation_data fetch failed: {e}")
+                reservations = []
+            step += 1
+
+        live_rates = {}
+        occupancy_avail = {}
+        occupancy_vacant = {}
+        last_night = dates[-1]
+        got_live_occupancy = bool(reservations)
+
+        for listing in listings:
+            listing_id = str(listing.get('id', ''))
+            listing_label = listing.get('name', listing_id)
+            if progress_callback:
+                progress_callback(step, total_steps, listing_label)
+            step += 1
+            if not listing_id:
+                continue
+
+            try:
+                units = int(listing.get('units', 1) or 1)
+            except (TypeError, ValueError):
+                units = 1
+
+            daily = {}
+            try:
+                daily = api.get_listing_daily_data(listing_id, pms, dates[0], last_night)
+                if daily:
+                    got_live_occupancy = True
+            except Exception as e:
+                logger.warning(f"listing_prices failed for {listing_label} ({listing_id}): {e}")
+
+            reserved = {}
+            if units > 1:
+                reserved = count_reservations_by_date(reservations, listing_id, dates)
+
+            occ = compute_nightly_occupancy(units, dates, daily, reserved)
+            for date_str, info in occ.items():
+                key = f"{listing_id}_{date_str}"
+                occupancy_avail[key] = info['available']
+                occupancy_vacant[key] = info['vacant']
+
+            try:
+                payload = api.get_listing_overrides(listing_id, pms=pms)
+                parsed = parse_listing_overrides(payload, start_date=dates[0], end_date=last_night)
+                for date_str, info in parsed.items():
+                    if date_str in dates:
+                        live_rates[f"{listing_id}_{date_str}"] = {
+                            'price': info['price'],
+                            'min_stay': info.get('min_stay', 1),
+                            'currency': 'USD'
+                        }
+            except Exception as e:
+                logger.warning(f"Override GET failed for {listing_label} ({listing_id}): {e}")
+
+        rate_source = 'api' if live_rates else ('csv' if csv_rates else 'none')
+        if not live_rates and csv_rates:
+            live_rates = csv_rates
+
+        occupancy_source = 'api' if got_live_occupancy else ('csv' if pl_availability else 'none')
+        occupancy = {'availability': occupancy_avail, 'vacant_units': occupancy_vacant}
+        if occupancy_source != 'api' and pl_availability:
+            occupancy = {'availability': pl_availability, 'vacant_units': pl_vacant}
+
+        return {
+            'live_rates': live_rates,
+            'occupancy': occupancy,
+            'rate_source': rate_source,
+            'occupancy_source': occupancy_source,
+        }
+
+    def fetch_live_override_rates(
+        self,
+        property_name: str,
+        start_date: str,
+        end_date: str,
+        progress_callback: Optional[Callable] = None
+    ) -> Tuple[Dict[str, Dict], str]:
+        """Live prices for a stay. Prefers GET listing overrides, then local CSV."""
+        stay = self.fetch_live_stay_data(
+            property_name, start_date, end_date, progress_callback=progress_callback
+        )
+        return stay['live_rates'], stay['rate_source']
+
+    def fetch_live_occupancy(
+        self,
+        property_name: str,
+        start_date: str,
+        end_date: str,
+        progress_callback: Optional[Callable] = None
+    ) -> Tuple[Dict, str]:
+        """Live occupancy for a stay. Falls back to local pl_daily."""
+        stay = self.fetch_live_stay_data(
+            property_name, start_date, end_date, progress_callback=progress_callback
+        )
+        return stay['occupancy'], stay['occupancy_source']
+
     def get_room_rates(
         self, 
         property_name: str, 
         start_date: str, 
         end_date: str,
-        use_live_rates: bool = True
+        use_live_rates: bool = True,
+        live_rates: Optional[Dict[str, Dict]] = None,
+        use_live_occupancy: bool = True,
+        occupancy: Optional[Dict] = None,
+        progress_callback: Optional[Callable] = None
     ) -> List[RoomRate]:
         """
         Get room rates for a property and date range
@@ -403,7 +589,11 @@ class RoomBuyoutCalculator:
             property_name: Property identifier (e.g., 'onera')
             start_date: Check-in date in YYYY-MM-DD format (inclusive)
             end_date: Check-out date in YYYY-MM-DD format (exclusive - this date is NOT included)
-            use_live_rates: Whether to prefer live rates over pl_daily
+            use_live_rates: Fetch GET /listings/{id}/overrides for prices
+            live_rates: Pre-fetched live rate map, keyed "listing_id_date" -> {price, min_stay, currency}
+            use_live_occupancy: Fetch live occupancy (listing_prices / reservation_data)
+            occupancy: Pre-fetched {availability, vacant_units} maps
+            progress_callback: Optional (index, total, listing_name) during live fetches
         
         Returns:
             List of RoomRate objects
@@ -413,18 +603,32 @@ class RoomBuyoutCalculator:
             - start_date='2026-09-07', end_date='2026-09-09' means nights of Sept 7 and 8 only
             - This follows standard hotel booking convention where checkout date is not charged
         """
-        # Generate date range (end_date is checkout date, so exclude it)
         dates = self.generate_date_range(start_date, end_date)
-        
-        # Get listing metadata
         listing_metadata = self._get_listing_metadata(property_name)
-        
-        # Load rates - prefer pl_daily since it has occupancy data
         pl_rates, pl_availability, pl_vacant_units = self._load_pl_daily_rates(property_name, dates)
-        live_rates = {}
-        if use_live_rates:
-            # Load live rates as fallback/override for pricing
-            live_rates = self._load_live_rates(property_name, dates)
+
+        need_live = (
+            (live_rates is None and use_live_rates)
+            or (occupancy is None and use_live_occupancy)
+        )
+        stay = None
+        if need_live:
+            stay = self.fetch_live_stay_data(
+                property_name, start_date, end_date, progress_callback=progress_callback
+            )
+
+        if live_rates is None and use_live_rates:
+            live_rates = stay['live_rates'] if stay else {}
+        elif live_rates is None:
+            live_rates = {}
+
+        if occupancy is None and use_live_occupancy:
+            occupancy = stay['occupancy'] if stay else {'availability': {}, 'vacant_units': {}}
+        elif occupancy is None:
+            occupancy = {'availability': {}, 'vacant_units': {}}
+
+        live_avail = occupancy.get('availability') or {}
+        live_vacant = occupancy.get('vacant_units') or {}
         
         # Build RoomRate objects
         room_rates = []
@@ -437,31 +641,25 @@ class RoomBuyoutCalculator:
             
             for date_str in dates:
                 live_key = f"{listing_id}_{date_str}"
-                
-                # Prefer pl_daily for occupancy data, but use live rates for pricing if available
-                if live_key in pl_rates:
-                    # Use pl_daily rate (has occupancy data)
-                    rates_by_date[date_str] = pl_rates[live_key]
-                    availability_by_date[date_str] = pl_availability.get(live_key, False)
-                    vacant_units_by_date[date_str] = pl_vacant_units.get(live_key, 0)
-                    
-                    # Override rate with live rate if available (but keep occupancy from pl_daily)
-                    if live_key in live_rates:
-                        rates_by_date[date_str] = live_rates[live_key]['price']
-                        min_stay = max(min_stay, live_rates[live_key].get('min_stay', 1))
-                        currency = live_rates[live_key].get('currency', 'USD')
-                elif live_key in live_rates:
-                    # Only live rates available - use them but assume all units available
+
+                if live_key in live_rates:
                     rates_by_date[date_str] = live_rates[live_key]['price']
-                    availability_by_date[date_str] = True
-                    vacant_units_by_date[date_str] = metadata['units']  # Assume all units available
                     min_stay = max(min_stay, live_rates[live_key].get('min_stay', 1))
                     currency = live_rates[live_key].get('currency', 'USD')
                 else:
-                    # No rate data for this date
-                    rates_by_date[date_str] = 0.0
-                    availability_by_date[date_str] = False
+                    rates_by_date[date_str] = pl_rates.get(live_key, 0.0)
+
+                if live_key in live_vacant:
+                    vacant_units_by_date[date_str] = live_vacant[live_key]
+                    availability_by_date[date_str] = live_avail.get(
+                        live_key, live_vacant[live_key] > 0
+                    )
+                elif live_key in pl_vacant_units:
+                    vacant_units_by_date[date_str] = pl_vacant_units[live_key]
+                    availability_by_date[date_str] = pl_availability.get(live_key, False)
+                else:
                     vacant_units_by_date[date_str] = 0
+                    availability_by_date[date_str] = False
             
             # Only include listings that have at least some rate data
             if any(rates_by_date.values()):
@@ -776,7 +974,9 @@ def main():
     
     # Get room rates
     print("Loading room rates...")
-    room_rates = calculator.get_room_rates(property_name, start_date, end_date)
+    room_rates = calculator.get_room_rates(
+        property_name, start_date, end_date, use_live_rates=False, use_live_occupancy=False
+    )
     print(f"Found {len(room_rates)} listings with rate data\n")
     
     # Select cheapest

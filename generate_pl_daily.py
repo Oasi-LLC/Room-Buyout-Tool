@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 tool_dir = Path(__file__).parent
 sys.path.insert(0, str(tool_dir))
 
-from utils.config import API_KEY, BASE_URL
+from utils.config import API_KEY, BASE_URL, require_api_key
 
 def get_listing_overrides(listing_id, pms, start_date, end_date, max_retries=3):
     """Get listing overrides for the date range with retry logic."""
@@ -336,7 +336,8 @@ def fetch_listing_data(listing, start_date, end_date, all_reservations, pms):
 
 def generate_pl_daily_for_property(property_key, start_date, end_date):
     """Generate pl_daily data for a specific property."""
-    
+    require_api_key()
+
     # Load property config
     config_path = tool_dir / "config" / "properties.yaml"
     with open(config_path, 'r') as f:
@@ -392,7 +393,8 @@ def generate_pl_daily_for_property(property_key, start_date, end_date):
 
 def generate_pl_daily_for_property_batched(property_key, start_date, end_date):
     """Generate pl_daily data for onera property using batch processing to avoid rate limits."""
-    
+    require_api_key()
+
     # Load property config
     config_path = tool_dir / "config" / "properties.yaml"
     with open(config_path, 'r') as f:
