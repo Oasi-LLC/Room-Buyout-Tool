@@ -12,6 +12,8 @@ from typing import Dict, List, Optional, Tuple, Callable
 from dataclasses import dataclass
 import logging
 
+from utils.date_manager import get_reservation_query_range
+
 logger = logging.getLogger(__name__)
 
 
@@ -472,7 +474,8 @@ class RoomBuyoutCalculator:
             if progress_callback:
                 progress_callback(step, total_steps, "Reservations")
             try:
-                reservations = api.fetch_all_reservations(pms, start_date, end_date)
+                res_start, res_end = get_reservation_query_range(start_date, end_date)
+                reservations = api.fetch_all_reservations(pms, res_start, res_end)
             except Exception as e:
                 logger.warning(f"reservation_data fetch failed: {e}")
                 reservations = []

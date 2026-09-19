@@ -21,6 +21,7 @@ tool_dir = Path(__file__).parent
 sys.path.insert(0, str(tool_dir))
 
 from utils.config import API_KEY, BASE_URL, require_api_key
+from utils.date_manager import get_reservation_query_range
 
 def get_listing_overrides(listing_id, pms, start_date, end_date, max_retries=3):
     """Get listing overrides for the date range with retry logic."""
@@ -362,7 +363,8 @@ def generate_pl_daily_for_property(property_key, start_date, end_date):
     
     # Get all reservations (will be filtered by listing ID later)
     t0 = time.time()
-    all_reservations = fetch_all_reservations(pms, start_date, end_date)
+    res_start, res_end = get_reservation_query_range(start_date, end_date)
+    all_reservations = fetch_all_reservations(pms, res_start, res_end)
     reservations_time = time.time() - t0
     print(f"📊 Found {len(all_reservations)} total reservations from {pms} (fetched in {reservations_time:.2f}s)\n")
     
@@ -419,7 +421,8 @@ def generate_pl_daily_for_property_batched(property_key, start_date, end_date):
     
     # Get all reservations (will be filtered by listing ID later)
     t0 = time.time()
-    all_reservations = fetch_all_reservations(pms, start_date, end_date)
+    res_start, res_end = get_reservation_query_range(start_date, end_date)
+    all_reservations = fetch_all_reservations(pms, res_start, res_end)
     reservations_time = time.time() - t0
     print(f"📊 Found {len(all_reservations)} total reservations from {pms} (fetched in {reservations_time:.2f}s)\n")
     
